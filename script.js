@@ -85,6 +85,8 @@
     let master = null;
 
     const unlock = () => {
+      // iOS 17+: que el audio web suene aunque el iPhone esté en modo silencio
+      try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (_) { /* no soportado */ }
       try {
         if (!ctx) {
           const AC = window.AudioContext || window.webkitAudioContext;
@@ -119,8 +121,44 @@
       o.stop(t + dur + 0.02);
     };
 
+    // Decodifica un archivo de audio para reproducirlo por Web Audio
+    const load = (url) => {
+      if (!ctx || !window.fetch) return Promise.reject(new Error('sin Web Audio'));
+      return fetch(url)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.arrayBuffer();
+        })
+        // Forma con callbacks: Safari antiguo no devuelve una promesa
+        .then((data) => new Promise((resolve, reject) => ctx.decodeAudioData(data, resolve, reject)));
+    };
+
+    // Reproduce un buffer en loop; devuelve controles para velocidad y parada
+    const loopBuffer = (buffer) => {
+      if (!ctx || state.muted) return null;
+      if (ctx.state === 'suspended') ctx.resume();
+      const src = ctx.createBufferSource();
+      const g = ctx.createGain();
+      src.buffer = buffer;
+      src.loop = true;
+      g.gain.value = 1;
+      src.connect(g);
+      g.connect(ctx.destination);
+      src.start(0);
+      return {
+        rate(v) { src.playbackRate.setTargetAtTime(v, ctx.currentTime, 0.05); },
+        stop() {
+          const t = ctx.currentTime;
+          g.gain.setTargetAtTime(0, t, 0.05);
+          src.stop(t + 0.25);
+        },
+      };
+    };
+
     return {
       unlock,
+      load,
+      loopBuffer,
       success: () => play((t) => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(t + i * 0.08, f, 0.12, { vol: 0.08 }))),
       win: () => play((t) => [784, 988, 1175, 1568].forEach((f, i) => tone(t + i * 0.1, f, i === 3 ? 0.4 : 0.12, { vol: 0.08 }))),
       fail: () => play((t) => tone(t, 220, 0.28, { type: 'sawtooth', vol: 0.06, to: 110 })),
@@ -179,12 +217,11 @@
       state.audioUnlocked = true;
       sfx.unlock();
 
-      // "Desbloquea" los latidos ahora para poder reproducirlos más tarde en iOS
-      beat.muted = true;
-      const primed = beat.play();
-      if (primed && primed.then) {
-        primed.then(() => { beat.pause(); beat.currentTime = 0; beat.muted = state.muted; }).catch(() => {});
-      }
+      // Los latidos van por Web Audio: en iOS / WhatsApp un segundo <audio>
+      // no suena si no se inició con volumen dentro de un toque, y choca con la música.
+      sfx.load(beat.getAttribute('src'))
+        .then((buffer) => { beatBuffer = buffer; })
+        .catch(() => { beatBuffer = null; }); // respaldo: elemento <audio>
 
       if (!available) return;
       try { audio.volume = 0; } catch (_) { /* iOS */ }
@@ -202,19 +239,30 @@
     // Baja la música mientras suenan los latidos
     const duck = (on) => { if (started) fadeTo(on ? 0.15 : base, 600); };
 
+    let beatBuffer = null;
+    let beatVoice = null;
+
     const heartbeat = {
       play() {
-        beat.currentTime = 0;
-        beat.playbackRate = 1;
-        beat.muted = state.muted;
-        beat.play().catch(() => {});
+        heartbeat.stop();
+        if (beatBuffer) {
+          beatVoice = sfx.loopBuffer(beatBuffer);
+        } else {
+          beat.currentTime = 0;
+          beat.playbackRate = 1;
+          beat.muted = state.muted;
+          beat.play().catch(() => {});
+        }
         duck(true);
       },
       rate(progress) {
         // Los latidos se aceleran a medida que se llena el círculo
-        try { beat.playbackRate = 1 + progress * 0.45; } catch (_) { /* navegador sin soporte */ }
+        const v = 1 + progress * 0.45;
+        if (beatVoice) beatVoice.rate(v);
+        else try { beat.playbackRate = v; } catch (_) { /* navegador sin soporte */ }
       },
       stop() {
+        if (beatVoice) { beatVoice.stop(); beatVoice = null; }
         beat.pause();
         duck(false);
       },
@@ -224,6 +272,7 @@
       state.muted = !state.muted;
       audio.muted = state.muted;
       beat.muted = state.muted;
+      if (state.muted && beatVoice) { beatVoice.stop(); beatVoice = null; }
       btn.classList.toggle('is-muted', state.muted);
       btn.setAttribute('aria-pressed', String(state.muted));
       if (!state.muted && audio.paused && started) audio.play().catch(() => {});
@@ -234,7 +283,7 @@
     // Pausar si WhatsApp / el navegador pasa a segundo plano
     document.addEventListener('visibilitychange', () => {
       if (!started) return;
-      if (document.hidden) { audio.pause(); beat.pause(); }
+      if (document.hidden) { audio.pause(); heartbeat.stop(); }
       else if (!state.muted) audio.play().catch(() => {});
     });
 
