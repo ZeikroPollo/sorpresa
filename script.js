@@ -286,9 +286,9 @@
       },
       rate(progress) {
         // Los latidos se aceleran a medida que se llena el círculo
-        const v = 1 + progress * 0.45;
-        if (beatVoice) beatVoice.rate(v);
-        else try { beat.playbackRate = v; } catch (_) { /* navegador sin soporte */ }
+        // Solo en Web Audio: en iOS, cambiar playbackRate de un <audio> en cada
+        // cuadro reinicia su procesamiento y el latido deja de oírse.
+        if (beatVoice) beatVoice.rate(1 + progress * 0.45);
       },
       stop() {
         holding = false;
