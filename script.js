@@ -100,6 +100,14 @@
       } catch (_) { /* sin Web Audio */ }
     };
 
+    // iOS "interrumpe" el audio web al arrancar la música y solo deja
+    // reanudarlo dentro de un gesto real (al levantar el dedo o en un click)
+    const resume = () => {
+      if (ctx && ctx.state !== 'running' && ctx.state !== 'closed') ctx.resume().catch(() => {});
+    };
+    document.addEventListener('touchend', resume, { passive: true });
+    document.addEventListener('click', resume);
+
     const play = (fn) => {
       if (!ctx || state.muted) return;
       if (ctx.state === 'suspended') ctx.resume();
@@ -157,6 +165,8 @@
 
     return {
       unlock,
+      resume,
+      state: () => (ctx ? ctx.state : 'sin contexto'),
       load,
       loopBuffer,
       success: () => play((t) => [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => tone(t + i * 0.08, f, 0.12, { vol: 0.08 }))),
@@ -217,11 +227,20 @@
       state.audioUnlocked = true;
       sfx.unlock();
 
-      // Los latidos van por Web Audio: en iOS / WhatsApp un segundo <audio>
-      // no suena si no se inició con volumen dentro de un toque, y choca con la música.
+      // iOS solo deja sonar más tarde un <audio> cuyo play() se llamó CON volumen
+      // dentro de un toque (hacerlo silenciado no cuenta). Se pausa al instante,
+      // antes de que llegue a sonar.
+      try {
+        beat.muted = false;
+        const unlocking = beat.play();
+        beat.pause();
+        if (unlocking && unlocking.catch) unlocking.catch(() => {});
+      } catch (_) { /* navegador sin soporte */ }
+
+      // Respaldo por Web Audio, por si el <audio> fuera rechazado
       sfx.load(beat.getAttribute('src'))
         .then((buffer) => { beatBuffer = buffer; })
-        .catch(() => { beatBuffer = null; }); // respaldo: elemento <audio>
+        .catch((err) => { beatBuffer = null; debugInfo.loadError = String(err); });
 
       if (!available) return;
       try { audio.volume = 0; } catch (_) { /* iOS */ }
@@ -241,17 +260,27 @@
 
     let beatBuffer = null;
     let beatVoice = null;
+    let holding = false;
+    const debugInfo = { playError: '', loadError: '', mode: '' };
 
     const heartbeat = {
+      // Primero el <audio> (suena aunque el iPhone esté en silencio);
+      // si el navegador lo rechaza, el mismo archivo por Web Audio.
       play() {
         heartbeat.stop();
-        if (beatBuffer) {
-          beatVoice = sfx.loopBuffer(beatBuffer);
-        } else {
-          beat.currentTime = 0;
-          beat.playbackRate = 1;
-          beat.muted = state.muted;
-          beat.play().catch(() => {});
+        holding = true;
+        try { beat.currentTime = 0; } catch (_) { /* aún sin metadatos */ }
+        beat.playbackRate = 1;
+        beat.muted = state.muted;
+        debugInfo.mode = 'audio';
+        const playing = beat.play();
+        if (playing && playing.catch) {
+          playing.catch((err) => {
+            debugInfo.playError = err && err.name ? err.name : String(err);
+            if (!holding || !beatBuffer) return;
+            debugInfo.mode = 'webaudio';
+            beatVoice = sfx.loopBuffer(beatBuffer);
+          });
         }
         duck(true);
       },
@@ -262,11 +291,30 @@
         else try { beat.playbackRate = v; } catch (_) { /* navegador sin soporte */ }
       },
       stop() {
+        holding = false;
         if (beatVoice) { beatVoice.stop(); beatVoice = null; }
         beat.pause();
         duck(false);
       },
     };
+
+    // Diagnóstico en pantalla: abrir el link con ?debug
+    if (/[?&]debug\b/.test(location.search)) {
+      const panel = document.createElement('pre');
+      panel.style.cssText =
+        'position:fixed;left:8px;bottom:8px;z-index:99;margin:0;padding:8px 10px;max-width:calc(100% - 16px);' +
+        'font:11px/1.4 monospace;white-space:pre-wrap;background:rgba(0,0,0,.75);color:#fff;border-radius:8px;pointer-events:none';
+      document.body.appendChild(panel);
+      setInterval(() => {
+        panel.textContent = [
+          `webaudio: ${sfx.state()} · buffer: ${beatBuffer ? 'ok' : 'no'}`,
+          `latido: ${beat.paused ? 'pausado' : 'sonando'} · t=${beat.currentTime.toFixed(2)} · ready=${beat.readyState}`,
+          `latido muted=${beat.muted} · err=${beat.error ? beat.error.code : '-'} · modo=${debugInfo.mode || '-'}`,
+          `play error: ${debugInfo.playError || '-'} · load error: ${debugInfo.loadError || '-'}`,
+          `música: ${audio.paused ? 'pausada' : 'sonando'} · silenciado=${state.muted}`,
+        ].join('\n');
+      }, 400);
+    }
 
     const toggle = () => {
       state.muted = !state.muted;
